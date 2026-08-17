@@ -1,0 +1,14 @@
+.git
+.venv
+venv
+__pycache__
+oauth-client.json
+token.json
+.env
+*.md
+.DS_Store
+tmp
+service-account.json
+*.jpg
+*.png
+*.pdf
