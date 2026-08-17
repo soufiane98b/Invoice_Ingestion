@@ -4,6 +4,245 @@ Tu envoies une **photo** sur WhatsApp. Le bot lit la facture (Gemini Flash **gra
 
 Rien n’est écrit tant que tu n’as pas répondu **OK**. Coût visé : **0 €** (quotas gratuits, ~200 factures/mois).
 
+## Comment ça marche
+
+Le Mac **n’est pas** dans la boucle une fois déployé. WhatsApp réveille Cloud Run ; Cloud Run parle à Meta, Gemini, Drive et Sheets.
+
+### 1. Qui appelle qui (prod)
+
+```mermaid
+flowchart LR
+  subgraph Toi
+    WA["WhatsApp perso<br/>212771610194"]
+  end
+
+  subgraph Meta["Meta Cloud API"]
+    WABA["Numéro Business / test<br/>PHONE_NUMBER_ID"]
+    Graph["graph.facebook.com/v21.0"]
+    Hook["Webhook HTTPS<br/>messages ON"]
+  end
+
+  subgraph GCP["Google Cloud — projet maximal-coast-505720-t9"]
+    CR["Cloud Run invoice-bot<br/>us-central1 · min=0 · max=2"]
+    CB["Cloud Build + Artifact Registry<br/>image Docker depuis Dockerfile"]
+    ENV["Variables du service<br/>.env + token.json collés au deploy"]
+  end
+
+  subgraph Google["APIs Google — compte OAuth Gmail Drive"]
+    Gem["Gemini Flash<br/>AI Studio palier Free"]
+    Dr["Drive<br/>dossier Factures"]
+    Sh["Sheets<br/>ApexData gid 1923965794"]
+  end
+
+  WA -->|"photo / OK / correction"| WABA
+  WABA -->|"POST /webhook<br/>X-Hub-Signature-256"| CR
+  CR -->|"GET media + POST messages<br/>Bearer WHATSAPP_TOKEN"| Graph
+  Graph --> WABA
+  WABA -->|"bulle de réponse"| WA
+  CR --> Gem
+  CR --> Dr
+  CR --> Sh
+  ENV -.-> CR
+  CB -.-> CR
+  Hook -.-> CR
+```
+
+| Pièce | Utilité | Qui l’appelle |
+|---|---|---|
+| **WhatsApp perso** | Seul canal humain. Photo, `OK`, `montant=…`, `ANNULER`. | Toi |
+| **Meta / WABA** | Transporte les messages. N’extrait rien. Abonne `messages` vers l’URL Cloud Run. | Toi → Meta ; Meta → Cloud Run |
+| **Cloud Run `invoice-bot`** | Exécute FastAPI. Dort à 0 instance, se réveille sur HTTP. | Meta `POST /webhook` |
+| **Variables d’env** | Clés (pas de `.env` dans l’image). Injectées par `deploy/cloudrun.sh`. | Cloud Run au boot |
+| **Gemini** | OCR + JSON date / montant / catégorie / moyen. | `app/extract.py` |
+| **Drive** | Fichier facture + `bot-state.json` (brouillon si le conteneur meurt). | `app/drive_store.py` après **OK** (fichier) ; `app/session.py` en continu (état) |
+| **Sheets** | Une ligne colonnes **A–I**. | `app/sheets_store.py` après **OK** |
+
+### 2. Déploiement (`deploy/cloudrun.sh`)
+
+Le script **ne pousse pas GitHub**. Il lit les secrets **sur le Mac** et envoie code + variables à GCP.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor Dev as Mac (ce repo)
+  participant SH as deploy/cloudrun.sh
+  participant GC as gcloud
+  participant APIs as GCP APIs enable
+  participant Build as Cloud Build
+  participant AR as Artifact Registry
+  participant Run as Cloud Run invoice-bot
+  participant Meta as Meta webhook (manuel)
+
+  Dev->>SH: ./deploy/cloudrun.sh
+  Note over SH: Exige .env + token.json en local<br/>.dockerignore exclut .env token.json oauth-client.json
+  SH->>SH: Python : .env → YAML temporaire<br/>inline token.json / oauth-client.json / service-account.json
+  SH->>GC: config set project maximal-coast-505720-t9
+  SH->>APIs: enable run, cloudbuild, artifactregistry, drive, sheets
+  SH->>Build: gcloud run deploy --source .<br/>Dockerfile → pip install → COPY app/
+  Build->>AR: image invoice-bot
+  Build->>Run: révision (512Mi, CPU 1, timeout 120s,<br/>min-instances 0, allow-unauthenticated)
+  SH->>Run: --env-vars-file (GEMINI_*, WHATSAPP_*, GOOGLE_* …)
+  Run-->>SH: URL https://invoice-bot-….run.app
+  SH->>Run: update APP_PUBLIC_URL = cette URL
+  Note over Dev,Meta: Une fois : Meta Callback URL = {URL}/webhook<br/>Verify token = WHATSAPP_VERIFY_TOKEN
+```
+
+Fichiers déploiement :
+
+| Fichier | Rôle |
+|---|---|
+| `Dockerfile` | Image Python 3.12, `uvicorn app.main:app` sur `$PORT` |
+| `.dockerignore` | Empêche `.env` / jetons d’entrer dans l’image |
+| `deploy/cloudrun.sh` | Build + env + `APP_PUBLIC_URL` |
+| `Procfile` | Fallback PaaS (Koyeb, etc.) si pas Cloud Run |
+
+### 3. Enchaînement d’une facture (après le deploy)
+
+Meta exige un **HTTP 200 en ~5 s**. Gemini prend 8–20 s, donc en prod Cloud Run **ne traite pas** dans le `POST /webhook` : il relance une 2ᵉ requête sur lui-même (`/internal/process`) avec CPU alloué jusqu’à 120 s.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor U as Toi (WhatsApp)
+  participant M as Meta Graph
+  participant WH as POST /webhook
+  participant DP as Thread _dispatch_internal
+  participant IN as POST /internal/process
+  participant H as handler.py
+  participant WA as whatsapp.py
+  participant IM as image_util.py
+  participant EX as extract.py / Gemini
+  participant SE as session.py
+  participant DR as Drive bot-state.json
+  participant IG as ingest.py
+  participant DV as Drive Factures/année/catégorie
+  participant SH as Sheets ApexData A–I
+
+  U->>M: photo JPEG/PDF
+  M->>WH: POST JSON + HMAC SHA256 (WHATSAPP_APP_SECRET)
+  WH->>WH: vérifier signature + parse JSON
+  WH->>DP: démarrer thread HTTP
+  WH-->>M: 200 OK en moins de 1 s
+  M-->>U: (accusé réseau, pas encore le récap)
+
+  DP->>IN: POST {payload} header X-Internal-Token
+  IN->>IN: comparer INTERNAL_TOKEN
+  IN->>H: handle_webhook_payload
+
+  H->>H: parse_incoming (ignore les statuts delivered/read)
+  H->>H: from == ALLOWED_WHATSAPP_NUMBER sinon stop
+  H->>H: wamid déjà dans processed_ids ? stop
+  H->>WA: send_text Photo reçue…
+  WA->>M: POST /PHONE_NUMBER_ID/messages
+  M-->>U: bulle Photo reçue…
+
+  H->>WA: GET /media_id puis GET url binaire
+  H->>IM: compress JPEG si image
+  H->>EX: extract_invoice bytes + mime
+  EX->>EX: JSON Gemini, année = année courante
+  H->>SE: save_state draft + media_b64
+  SE->>DR: write bot-state.json (survit au scale-to-zero)
+  H->>WA: send_text récap
+  M-->>U: Je propose : date, montant, catégorie…
+
+  U->>M: OK  ou  montant=800  ou  ANNULER
+  M->>WH: POST /webhook (même chaîne 200 + /internal/process)
+  IN->>H: _handle_text
+
+  alt ANNULER
+    H->>SE: clear_draft
+    H->>WA: Brouillon annulé
+  else correction
+    H->>H: dialogue.apply_corrections
+    H->>SE: save_state
+    H->>WA: nouveau récap
+  else OK
+    H->>H: missing_required ?
+    H->>IG: ingest(draft, media, mime)
+    IG->>DV: mkdir année / catégorie / mois si besoin<br/>upload nom unique YYYY-MM-DD_desc_montant.ext
+    IG->>SH: append ligne + formules Année/Mois + Voir facture
+    H->>SE: clear_draft
+    H->>WA: Ingéré ligne N + lien Drive
+  end
+```
+
+**Rien n’est écrit dans ApexData / le dossier catégorie tant que `OK` n’est pas reçu.** Avant ça, seul `bot-state.json` (brouillon) est mis à jour.
+
+### 4. Modules Python — qui appelle qui
+
+```mermaid
+flowchart TB
+  subgraph HTTP["app/main.py — FastAPI"]
+    GETW["GET /webhook : vérif Meta hub.verify_token"]
+    POSTW["POST /webhook : HMAC puis dispatch"]
+    INT["POST /internal/process : INTERNAL_TOKEN"]
+    HL["GET /health"]
+    PR["GET /privacy"]
+  end
+
+  subgraph Core["Traitement"]
+    HA["handler.py<br/>filtre numéro, dédup wamid, photo vs texte"]
+    DI["dialogue.py<br/>OK / ANNULER / pas de facture / corrections"]
+    EX["extract.py<br/>Gemini → JSON métier"]
+    NM["normalize.py + config.py<br/>listes fermées catégories / moyens"]
+    FM["formatting.py<br/>date année courante, montant FR, nom fichier unique"]
+    IM["image_util.py<br/>resize JPEG avant Gemini"]
+    IG["ingest.py<br/>orchestre Drive puis Sheets"]
+  end
+
+  subgraph IO["I/O"]
+    WA["whatsapp.py<br/>Graph send_text + download_media"]
+    SE["session.py<br/>RAM + Drive bot-state.json"]
+    AU["google_auth.py<br/>OAuth user token.json prioritaire<br/>sinon compte de service"]
+    DV["drive_store.py"]
+    SH["sheets_store.py"]
+  end
+
+  subgraph HorsLigne["Hors WhatsApp"]
+    CLI["cli.py : python -m app.cli facture.jpg"]
+    LOGIN["google_login.py : python -m app.google_login"]
+  end
+
+  POSTW --> INT
+  INT --> HA
+  HA --> WA
+  HA --> IM --> EX --> NM
+  HA --> DI
+  HA --> SE --> DV
+  HA --> IG
+  IG --> DV
+  IG --> SH
+  DV --> AU
+  SH --> AU
+  CLI --> EX
+  LOGIN --> AU
+```
+
+| Module | Rôle précis |
+|---|---|
+| `main.py` | Ports HTTP. Prod : ack rapide + auto-appel `/internal/process`. Local : `BackgroundTasks` si `APP_PUBLIC_URL` vide. |
+| `handler.py` | Un message à la fois côté métier : 1 brouillon, 1 fichier. Un album de 3 photos = 3 récaps, le **dernier** gagne. |
+| `whatsapp.py` | Client Graph v21. Sans token valide : le webhook peut arriver, **aucune bulle** en retour. |
+| `extract.py` | Essaie plusieurs modèles Flash si 404. |
+| `session.py` | État partagé. Cloud Run scale-to-zero → relecture Drive. |
+| `google_auth.py` | Refresh OAuth en mémoire (pas d’écriture disque en prod). |
+| `drive_store.py` | `Factures/{année}/{catégorie}/{MM-YYYY}/` + collision `_2`, `_3`. |
+| `sheets_store.py` | Étend le tableau (bandes, listes déroulantes). Colonne I = toujours `RAS`. |
+| `cli.py` | Test Gemini sans Meta. `--ecrire` pour Drive/Sheets en local. |
+
+### 5. Réveil Cloud Run
+
+```mermaid
+stateDiagram-v2
+  [*] --> Dormant : min-instances = 0, plus de HTTP ~15 min
+  Dormant --> Froid : POST /webhook ou GET /health
+  Froid --> Chaud : uvicorn + Invoice bot prêt (~2-8 s)
+  Chaud --> Chaud : autres messages, CPU alloué
+  Chaud --> Dormant : idle
+```
+
+Un **Test** Meta ou une **vraie photo** réveillent **pareil**. Pas besoin du Test pour le quotidien.
+
 ## Ce que tu dois faire une fois (comptes)
 
 Le code est dans ce repo. Les clés et partages, c’est toi.
@@ -107,16 +346,13 @@ Conditions pour rester à **0 €** :
 
 ```bash
 # Un compte de facturation Google est demandé (carte de vérif).
-export PROJECT_ID=ton-projet-gcp
+export PROJECT_ID=maximal-coast-505720-t9
 chmod +x deploy/cloudrun.sh
 ./deploy/cloudrun.sh
 ```
 
-Puis dans Cloud Run → Variables et secrets, colle toutes les clés `.env`.  
-**`APP_PUBLIC_URL`** = URL du service (`https://invoice-bot-xxxxx.us-central1.run.app`) **sans slash final**.  
-**`GOOGLE_SERVICE_ACCOUNT_JSON`** = le JSON **sur une seule ligne**.
-
-Webhook Meta (prod) : `https://invoice-bot-xxxxx.us-central1.run.app/webhook`
+Le script colle tout le `.env` (et les JSON Google) en variables Cloud Run, puis écrit **`APP_PUBLIC_URL`**.  
+Webhook Meta (prod) : `https://invoice-bot-….run.app/webhook` (l’URL exacte s’affiche en fin de script).
 
 Le service doit être **invocable sans auth** sur `/webhook` (WhatsApp n’envoie pas de compte Google). `/internal/process` est protégé par `INTERNAL_TOKEN`.
 
