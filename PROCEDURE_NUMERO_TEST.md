@@ -10,7 +10,7 @@ Non, on ne peut pas tout gérer uniquement avec l’API.
 |---|---|
 | Réclamer un nouveau numéro de test | Écran Meta, bouton **Claim test number**. Pas d’API publique. |
 | Ajouter ton portable et saisir le code SMS | Écran Meta, champ **Recipient**. Pas d’API. |
-| Générer un jeton s’il est mort | Écran Meta, **Generate token**, puis `.env`. Le jeton déjà dans `.env` suffit souvent. |
+| Générer un jeton d’envoi | Une fois : utilisateur système **invoice-bot**, expiration **Never**. Ne pas utiliser **Generate token** de la page **Try it out** (il meurt en quelques heures). |
 | Abonner l’appli **Factures ApexData** au nouveau compte | API. C’est l’étape qui manquait le 16 nov. 2026. |
 | Vérifier que le webhook pointe vers Cloud Run | API (lecture). L’URL elle-même se pose une fois dans Meta. |
 | Mettre le nouveau Phone number ID en prod | `.env` puis `./deploy/cloudrun.sh`. |
@@ -28,7 +28,7 @@ App **Factures ApexData** → use case **Connect with customers through WhatsApp
    - **Messaging account ID** → identifiant du compte (WABA), utilisé seulement pour l’abonnement API
 3. **Recipient** : ajouter le portable en `+212…`, valider le code. Sans ça, Meta n’accepte pas les messages.
 4. Ne pas cliquer **Send message** (modèle de démo).
-5. Ne remplacer `WHATSAPP_TOKEN` que si l’ancien jeton renvoie une erreur d’auth. Le bouton **Generate token** de cette page produit souvent un jeton de 24 h.
+5. Ne pas cliquer **Generate token** sur cette page, et ne pas remplacer `WHATSAPP_TOKEN` à chaque nouveau numéro. Ce bouton donne un jeton de quelques heures. Le 16 nov. 2026 il a cessé de marcher le soir même : les messages arrivaient (`POST /webhook` 200) mais l’envoi répondait `401` / `code 190`.
 
 Le webhook est déjà :
 
@@ -37,6 +37,35 @@ https://invoice-bot-n4qs2xf6ca-uc.a.run.app/webhook
 ```
 
 Jeton de vérification = `WHATSAPP_VERIFY_TOKEN` dans `.env`. Ne pas le changer. S’il faut le reposer : **Customize → Configuration → Verify and save**, puis cocher **messages**. Ce clic n’envoie rien sur WhatsApp : Meta appelle juste l’URL. Succès = la page reste enregistrée. Échec = erreur rouge sur le jeton.
+
+## Jeton d’envoi (une fois, pas à chaque numéro)
+
+`WHATSAPP_TOKEN` doit être un jeton d’utilisateur système, sans date de fin. Celui en place depuis le 20 nov. 2026 est de type `SYSTEM_USER`, appli **Factures ApexData**, `expires_at` = 0.
+
+Le refaire seulement s’il est révoqué ou si l’envoi renvoie `401` / `code 190`.
+
+1. [business.facebook.com/settings](https://business.facebook.com/settings) → **Users** → **System users**.
+2. **invoice-bot** (Admin). S’il n’existe pas : **Add**, rôle Admin.
+3. Assets : appli **Factures ApexData** en **Full access**, et le compte WhatsApp du numéro de test (**+1 555 …**) en contrôle total. **Assign people** sur le compte WhatsApp, ou **Add assets** depuis la fiche de l’utilisateur.
+4. **Generate token** → appli **Factures ApexData** → expiration **Never** → cocher `whatsapp_business_messaging` et `whatsapp_business_management`.
+5. Coller le jeton dans `.env` (`WHATSAPP_TOKEN`) puis `./deploy/cloudrun.sh`. Meta ne le réaffiche pas.
+
+Vérifier sans afficher le jeton (`expires_at` doit valoir 0) :
+
+```bash
+cd /Users/soufiane.boustique/Invoice_Ingestion
+python3 - <<'PY'
+import json, urllib.parse, urllib.request
+from pathlib import Path
+token = next(l.split("=",1)[1].strip() for l in Path(".env").read_text().splitlines() if l.startswith("WHATSAPP_TOKEN="))
+q = urllib.parse.urlencode({"input_token": token, "access_token": token})
+with urllib.request.urlopen(f"https://graph.facebook.com/debug_token?{q}", timeout=30) as r:
+    info = json.loads(r.read().decode())["data"]
+print({k: info.get(k) for k in ("is_valid", "type", "expires_at", "scopes")})
+PY
+```
+
+Il tombe si on clique **Revoke tokens**, ou si on retire l’appli ou le compte WhatsApp de **invoice-bot**. Un nouveau numéro de test est souvent un nouveau compte WhatsApp : réassigner ce compte à **invoice-bot**, sans régénérer le jeton.
 
 ## 2. Abonner l’appli (API)
 
@@ -98,13 +127,15 @@ gcloud logging read \
 ```
 
 - Aucun `POST /webhook` : l’abonnement WABA ou le destinataire `+212` manque. Refaire l’étape 2.
-- `POST /webhook` en 200 et pas de bulle : le jeton d’envoi ou le Phone number ID est faux.
+- `POST /webhook` en 200, puis `WhatsApp send failed 401` et `code 190` : le jeton d’envoi est mort. Refaire la section **Jeton d’envoi**. Ne pas prendre celui de **Try it out**.
+- `POST /webhook` en 200 et pas de bulle, sans 401 : le Phone number ID ne correspond pas au numéro.
 - `GET /webhook` en 403 sans `hub.challenge` : quelqu’un a ouvert l’URL dans le navigateur. Ce n’est pas Meta.
 
 ## À refaire dans ~90 jours
 
 1. Claim test number + noter Phone number ID et Messaging account ID.
 2. Recipient `+212` + code.
-3. `POST /{WABA_ID}/subscribed_apps`.
-4. `WHATSAPP_PHONE_NUMBER_ID` + `./deploy/cloudrun.sh`.
-5. Nouvelle discussion avec le nouveau `+1 555`.
+3. Réassigner ce compte WhatsApp à **invoice-bot** si c’est un nouveau compte. Garder le même `WHATSAPP_TOKEN`.
+4. `POST /{WABA_ID}/subscribed_apps`.
+5. `WHATSAPP_PHONE_NUMBER_ID` + `./deploy/cloudrun.sh`.
+6. Nouvelle discussion avec le nouveau `+1 555`.
